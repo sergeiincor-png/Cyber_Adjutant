@@ -1,11 +1,13 @@
 import os
-import time
 import telebot
 from flask import Flask
 from threading import Thread
-from google import genai
 
-# --- 1) ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖКИ ЖИЗНИ (если тебе нужно для healthcheck/ping) ---
+from google import genai
+from google.genai import types
+
+
+# --- 1) ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖКИ ЖИЗНИ (healthcheck/ping) ---
 app = Flask(__name__)
 
 @app.route("/")
@@ -20,6 +22,7 @@ def keep_alive():
     t = Thread(target=run_web, daemon=True)
     t.start()
 
+
 # --- 2) КЛЮЧИ ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -27,16 +30,36 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     raise RuntimeError("Проверь переменные окружения TELEGRAM_TOKEN и GEMINI_API_KEY")
 
-# --- 3) GEMINI (НОВЫЙ SDK) ---
-client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Выбираем актуальную модель.
-# Если вдруг на твоём ключе она недоступна — будет fallback ниже.
-MODEL_CANDIDATES = [
-    "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-1.5-flash",
-]
+# --- 3) GEMINI (НОВЫЙ SDK) ---
+# КРИТИЧНО: фикс 404 “not found for API version v1beta”
+# Принудительно используем стабильный API v1.
+client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(api_version="v1")
+)
+
+def pick_model_name() -> str:
+    """
+    Выбираем первую доступную модель, которая поддерживает generateContent.
+    Это надежнее, чем угадывать имя модели.
+    """
+    last = None
+    try:
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or getattr(m, "supportedActions", []) or []
+            if "generateContent" in actions:
+                # SDK часто возвращает 'models/....' — убираем префикс
+                return (m.name or "").replace("models/", "")
+        last = "Список моделей получен, но ни одна не поддерживает generateContent."
+    except Exception as e:
+        last = f"{type(e).__name__}: {e}"
+
+    raise RuntimeError(f"Не нашёл ни одной модели с generateContent для этого ключа. Детали: {last}")
+
+MODEL_NAME = pick_model_name()
+print("✅ Using model:", MODEL_NAME)
+
 
 # --- 4) TELEGRAM ---
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
@@ -51,7 +74,6 @@ SYSTEM_PROMPT = (
 )
 
 def gemini_answer(user_id: int, user_text: str) -> str:
-    # Собираем контекст: system + история + новое сообщение
     history = user_history.get(user_id, [])
     contents = [
         {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
@@ -59,31 +81,24 @@ def gemini_answer(user_id: int, user_text: str) -> str:
         {"role": "user", "parts": [{"text": user_text}]},
     ]
 
-    last_error = None
+    resp = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=contents,
+    )
 
-    for model_name in MODEL_CANDIDATES:
-        try:
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-            )
-            text = (resp.text or "").strip()
-            if text:
-                # сохраняем историю
-                new_history = history + [
-                    {"role": "user", "parts": [{"text": user_text}]},
-                    {"role": "model", "parts": [{"text": text}]},
-                ]
-                user_history[user_id] = new_history[-HISTORY_LIMIT:]
-                return text
+    text = (resp.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini вернул пустой ответ.")
 
-            last_error = RuntimeError(f"Пустой ответ от модели {model_name}")
+    # сохраняем историю
+    new_history = history + [
+        {"role": "user", "parts": [{"text": user_text}]},
+        {"role": "model", "parts": [{"text": text}]},
+    ]
+    user_history[user_id] = new_history[-HISTORY_LIMIT:]
 
-        except Exception as e:
-            last_error = e
+    return text
 
-    # Если ни одна модель не сработала — отдаём понятную ошибку (и логируем)
-    raise RuntimeError(f"Gemini не ответил. Последняя ошибка: {type(last_error).__name__}: {last_error}")
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
@@ -95,7 +110,6 @@ def handle_message(message):
 
     try:
         bot.send_chat_action(user_id, "typing")
-
         answer = gemini_answer(user_id, text)
 
         # Telegram лимит ~4096, режем безопасно
@@ -104,13 +118,14 @@ def handle_message(message):
             bot.send_message(user_id, answer[i:i + chunk_size])
 
     except Exception as e:
-        # ВАЖНО: временно показываем короткую причину, чтобы ты видел, что именно ломается
         err = f"{type(e).__name__}: {e}"
         print("❌ Gemini error:", err)
-        bot.reply_to(message, "Gemini сейчас не отвечает. Ошибка: " + err[:250])
+        bot.reply_to(message, "Gemini сейчас не отвечает. Ошибка: " + err[:350])
+
 
 if __name__ == "__main__":
     keep_alive()
     print("🚀 Web healthcheck on :8080")
     print("🤖 Bot is running (polling)...")
+    # timeout/long_polling_timeout помогают избежать подвисаний
     bot.infinity_polling(timeout=20, long_polling_timeout=20)
