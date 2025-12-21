@@ -18,8 +18,8 @@ def run_web_server():
     app.run(host='0.0.0.0', port=port)
 
 # --- 2. НАСТРОЙКИ БОТА ---
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+TELEGRAM_TOKEN = "8257461303:AAE1FQv_BPStOqxOx_28KSrCP_xytReE7Ck"
+GEMINI_API_KEY = "AIzaSyB_DKI4PQHl5_-CeUTpXOneMGq0f37q1Sw"
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     raise ValueError("ОШИБКА: Нет ключей в переменных окружения.")
@@ -72,5 +72,6 @@ if __name__ == '__main__':
     
     # Запускаем бота в основном потоке
     run_bot()
+
 
 
