@@ -55,7 +55,7 @@ def handle_message(message):
         bot.send_chat_action(user_id, 'typing')
         chat = user_chats[user_id]
         response = chat.send_message(message.text)
-        bot.reply_to(message, response.text, parse_mode='Markdown')
+        bot.reply_to(message, response.text)
     except Exception as e:
         bot.reply_to(message, "Ошибка обработки запроса.")
         print(f"Error: {e}")
@@ -72,4 +72,5 @@ if __name__ == '__main__':
     
     # Запускаем бота в основном потоке
     run_bot()
+
 
