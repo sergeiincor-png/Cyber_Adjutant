@@ -75,4 +75,6 @@ def handle_message(message):
         print(f"Error for user {user_id}: {e}")
 
 # Запуск бота в бесконечном режиме
+
+
 bot.polling(non_stop=True)
