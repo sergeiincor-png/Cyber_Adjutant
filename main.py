@@ -1,74 +1,116 @@
-import telebot
-import google.generativeai as genai
 import os
+import time
+import telebot
 from flask import Flask
 from threading import Thread
+from google import genai
 
-# --- 1. ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖКИ ЖИЗНИ (для Timeweb) ---
-app = Flask('')
+# --- 1) ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖКИ ЖИЗНИ (если тебе нужно для healthcheck/ping) ---
+app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
     return "Бот работает!"
 
-def run():
-    # Timeweb будет обращаться к этому порту, чтобы не выключать контейнер
-    app.run(host='0.0.0.0', port=8080)
+def run_web():
+    # Если Timeweb/балансер пингует порт — ок.
+    app.run(host="0.0.0.0", port=8080)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = Thread(target=run_web, daemon=True)
     t.start()
 
-# --- 2. НАСТРОЙКА КЛЮЧЕЙ И МОДЕЛЕЙ ---
+# --- 2) КЛЮЧИ ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    print("❌ ОШИБКА: Проверь переменные окружения TELEGRAM_TOKEN и GEMINI_API_KEY")
-    exit(1)
+    raise RuntimeError("Проверь переменные окружения TELEGRAM_TOKEN и GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# --- 3) GEMINI (НОВЫЙ SDK) ---
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Словарь для хранения истории чатов
-user_chats = {}
+# Выбираем актуальную модель.
+# Если вдруг на твоём ключе она недоступна — будет fallback ниже.
+MODEL_CANDIDATES = [
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-1.5-flash",
+]
 
-# --- 3. ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ---
+# --- 4) TELEGRAM ---
+bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
+
+# История диалогов (храним последние N сообщений на пользователя)
+user_history = {}
+HISTORY_LIMIT = 12  # 6 реплик пользователя + 6 ответов бота
+
+SYSTEM_PROMPT = (
+    "Ты — полезный ассистент в Telegram. Отвечай кратко и по делу. "
+    "Если вопрос непонятен — задай 1 уточняющий вопрос."
+)
+
+def gemini_answer(user_id: int, user_text: str) -> str:
+    # Собираем контекст: system + история + новое сообщение
+    history = user_history.get(user_id, [])
+    contents = [
+        {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+        *history,
+        {"role": "user", "parts": [{"text": user_text}]},
+    ]
+
+    last_error = None
+
+    for model_name in MODEL_CANDIDATES:
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+            )
+            text = (resp.text or "").strip()
+            if text:
+                # сохраняем историю
+                new_history = history + [
+                    {"role": "user", "parts": [{"text": user_text}]},
+                    {"role": "model", "parts": [{"text": text}]},
+                ]
+                user_history[user_id] = new_history[-HISTORY_LIMIT:]
+                return text
+
+            last_error = RuntimeError(f"Пустой ответ от модели {model_name}")
+
+        except Exception as e:
+            last_error = e
+
+    # Если ни одна модель не сработала — отдаём понятную ошибку (и логируем)
+    raise RuntimeError(f"Gemini не ответил. Последняя ошибка: {type(last_error).__name__}: {last_error}")
+
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     user_id = message.chat.id
-    
-    # Создаем сессию чата, если её еще нет
-    if user_id not in user_chats:
-        user_chats[user_id] = model.start_chat(history=[])
+    text = (message.text or "").strip()
+    if not text:
+        bot.reply_to(message, "Пришли текстом 🙂")
+        return
 
     try:
-        # Показываем статус "печает..."
-        bot.send_chat_action(user_id, 'typing')
-        
-        # Отправляем запрос в нейросеть
-        chat = user_chats[user_id]
-        response = chat.send_message(message.text)
-        full_text = response.text
+        bot.send_chat_action(user_id, "typing")
 
-        # Разбиваем ответ, если он длиннее 4096 символов (лимит Telegram)
-        if len(full_text) > 4000:
-            for i in range(0, len(full_text), 4000):
-                bot.send_message(user_id, full_text[i:i+4000])
-        else:
-            bot.reply_to(message, full_text)
+        answer = gemini_answer(user_id, text)
+
+        # Telegram лимит ~4096, режем безопасно
+        chunk_size = 4000
+        for i in range(0, len(answer), chunk_size):
+            bot.send_message(user_id, answer[i:i + chunk_size])
 
     except Exception as e:
-        print(f"Ошибка: {e}")
-        bot.reply_to(message, "Произошла ошибка при генерации ответа.")
+        # ВАЖНО: временно показываем короткую причину, чтобы ты видел, что именно ломается
+        err = f"{type(e).__name__}: {e}"
+        print("❌ Gemini error:", err)
+        bot.reply_to(message, "Gemini сейчас не отвечает. Ошибка: " + err[:250])
 
-# --- 4. ЗАПУСК ВСЕЙ СИСТЕМЫ ---
 if __name__ == "__main__":
-    # Сначала запускаем Flask в фоне
     keep_alive()
-    print("🚀 Веб-сервер запущен на порту 8080")
-    
-    # Затем запускаем Telegram бота
-    print("🤖 Бот запущен и готов к работе!")
-    bot.polling(none_stop=True)
+    print("🚀 Web healthcheck on :8080")
+    print("🤖 Bot is running (polling)...")
+    bot.infinity_polling(timeout=20, long_polling_timeout=20)
