@@ -66,8 +66,10 @@ def run_bot():
 
 if __name__ == '__main__':
     # Запускаем веб-сервер в отдельном потоке
-    t = Thread(target=run_web_server)
+    # 👇 Дописываем сюда daemon=True
+    t = Thread(target=run_web_server, daemon=True) 
     t.start()
     
     # Запускаем бота в основном потоке
     run_bot()
+
