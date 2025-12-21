@@ -3,96 +3,72 @@ import google.generativeai as genai
 import os
 from flask import Flask
 from threading import Thread
-import time
 
-# --- 1. ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖКИ ЖИЗНИ (Keep-alive) ---
-app = Flask(__name__)
+# --- 1. ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖКИ ЖИЗНИ (для Timeweb) ---
+app = Flask('')
 
 @app.route('/')
 def home():
-    return "Статус: Бот активен и слушает серверы Telegram."
+    return "Бот работает!"
 
-@app.route('/health')
-def health():
-    return {"status": "ok"}, 200
+def run():
+    # Timeweb будет обращаться к этому порту, чтобы не выключать контейнер
+    app.run(host='0.0.0.0', port=8080)
 
-def run_web_server():
-    # Timeweb обычно ожидает активность на порту 8080
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
-# --- 2. НАСТРОЙКИ И ПРОВЕРКА КЛЮЧЕЙ ---
-# Берем ключи из переменных окружения Timeweb
+# --- 2. НАСТРОЙКА КЛЮЧЕЙ И МОДЕЛЕЙ ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    print("❌ КРИТИЧЕСКАЯ ОШИБКА: Ключи не найдены в переменных окружения Timeweb!")
-    # Для теста можно вписать сюда, но для продакшна лучше через env
-    # TELEGRAM_TOKEN = "ваш_токен" 
+    print("❌ ОШИБКА: Проверь переменные окружения TELEGRAM_TOKEN и GEMINI_API_KEY")
+    exit(1)
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-pro')
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# Словарь для хранения истории чатов
 user_chats = {}
 
-# --- 3. ЛОГИКА БОТА ---
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.chat.id
-    user_chats[user_id] = model.start_chat(history=[])
-    bot.reply_to(message, "Привет! Я твой AI-ассистент на базе Gemini. Чем могу помочь?")
-
-@bot.message_handler(commands=['reset'])
-def reset_memory(message):
-    user_id = message.chat.id
-    user_chats[user_id] = model.start_chat(history=[])
-    bot.reply_to(message, "🧠 Память нашей беседы очищена.")
-
+# --- 3. ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ---
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     user_id = message.chat.id
-    # Инициализация чата, если пользователя нет в памяти
+    
+    # Создаем сессию чата, если её еще нет
     if user_id not in user_chats:
         user_chats[user_id] = model.start_chat(history=[])
 
     try:
+        # Показываем статус "печает..."
         bot.send_chat_action(user_id, 'typing')
+        
+        # Отправляем запрос в нейросеть
         chat = user_chats[user_id]
         response = chat.send_message(message.text)
-        bot.reply_to(message, response.text)
-   except Exception as e:
-        # Бот отправит текст самой ошибки вам в чат Telegram
-        bot.reply_to(message, f"Техническая ошибка: {str(e)}")
-        print(f"Error: {e}")
+        full_text = response.text
 
-# --- 4. ЗАПУСК ---
+        # Разбиваем ответ, если он длиннее 4096 символов (лимит Telegram)
+        if len(full_text) > 4000:
+            for i in range(0, len(full_text), 4000):
+                bot.send_message(user_id, full_text[i:i+4000])
+        else:
+            bot.reply_to(message, full_text)
 
-def run_bot():
-    # Важнейший шаг для исправления ошибки 409 Conflict:
-    print("Очистка старых соединений...")
-    bot.remove_webhook()
-    time.sleep(1) 
-    
-    print("✅ Бот запущен!")
-    # Используем infinity_polling для автоматического перезапуска при сбоях сети
-    bot.infinity_polling(timeout=20, long_polling_timeout=5)
-
-if __name__ == '__main__':
-    # 1. Сначала запускаем Flask в фоновом потоке
-    # Используем порт 5000 или 8080 (как в настройках Таймвеба)
-    port = int(os.environ.get('PORT', 8080))
-    t = Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
-    t.daemon = True
-    t.start()
-    
-    # 2. Даем серверу время подняться
-    time.sleep(2)
-    
-    # 3. Запускаем бота
-    try:
-        run_bot()
     except Exception as e:
-        print(f"Критический сбой бота: {e}")
+        print(f"Ошибка: {e}")
+        bot.reply_to(message, "Произошла ошибка при генерации ответа.")
 
+# --- 4. ЗАПУСК ВСЕЙ СИСТЕМЫ ---
+if __name__ == "__main__":
+    # Сначала запускаем Flask в фоне
+    keep_alive()
+    print("🚀 Веб-сервер запущен на порту 8080")
+    
+    # Затем запускаем Telegram бота
+    print("🤖 Бот запущен и готов к работе!")
+    bot.polling(none_stop=True)
