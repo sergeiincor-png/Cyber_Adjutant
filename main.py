@@ -1,35 +1,40 @@
 import telebot
 import google.generativeai as genai
 import os
-from flask import Flask  # <-- Добавили Flask
-from threading import Thread # <-- Добавили потоки
+from flask import Flask
+from threading import Thread
+import time
 
-# --- 1. НАСТРОЙКА "ФЕЙКОВОГО" ВЕБ-СЕРВЕРА ---
-# Это нужно, чтобы Timeweb не убивал бота
+# --- 1. ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖКИ ЖИЗНИ (Keep-alive) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Бот работает!"
+    return "Статус: Бот активен и слушает серверы Telegram."
+
+@app.route('/health')
+def health():
+    return {"status": "ok"}, 200
 
 def run_web_server():
-    # Запускаем сервер на порту 80 или том, который даст Timeweb
+    # Timeweb обычно ожидает активность на порту 8080
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- 2. НАСТРОЙКИ БОТА ---
-TELEGRAM_TOKEN = "8257461303:AAE1FQv_BPStOqxOx_28KSrCP_xytReE7Ck"
-GEMINI_API_KEY = "AIzaSyB_DKI4PQHl5_-CeUTpXOneMGq0f37q1Sw"
+# --- 2. НАСТРОЙКИ И ПРОВЕРКА КЛЮЧЕЙ ---
+# Берем ключи из переменных окружения Timeweb
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("ОШИБКА: Нет ключей в переменных окружения.")
+    print("❌ КРИТИЧЕСКАЯ ОШИБКА: Ключи не найдены в переменных окружения Timeweb!")
+    # Для теста можно вписать сюда, но для продакшна лучше через env
+    # TELEGRAM_TOKEN = "ваш_токен" 
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_chats = {}
-
-print("Бот готовится к запуску...")
 
 # --- 3. ЛОГИКА БОТА ---
 
@@ -37,17 +42,18 @@ print("Бот готовится к запуску...")
 def send_welcome(message):
     user_id = message.chat.id
     user_chats[user_id] = model.start_chat(history=[])
-    bot.reply_to(message, "Привет! Я твой AI-ассистент. Пиши, я отвечу.")
+    bot.reply_to(message, "Привет! Я твой AI-ассистент на базе Gemini. Чем могу помочь?")
 
 @bot.message_handler(commands=['reset'])
 def reset_memory(message):
     user_id = message.chat.id
     user_chats[user_id] = model.start_chat(history=[])
-    bot.reply_to(message, "Память очищена.")
+    bot.reply_to(message, "🧠 Память нашей беседы очищена.")
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     user_id = message.chat.id
+    # Инициализация чата, если пользователя нет в памяти
     if user_id not in user_chats:
         user_chats[user_id] = model.start_chat(history=[])
 
@@ -57,21 +63,29 @@ def handle_message(message):
         response = chat.send_message(message.text)
         bot.reply_to(message, response.text)
     except Exception as e:
-        bot.reply_to(message, "Ошибка обработки запроса.")
-        print(f"Error: {e}")
+        print(f"Ошибка Gemini: {e}")
+        bot.reply_to(message, "Извини, произошла ошибка при генерации ответа.")
 
-# --- 4. ЗАПУСК ВСЕГО ВМЕСТЕ ---
+# --- 4. ЗАПУСК ---
+
 def run_bot():
-    bot.polling(non_stop=True)
+    # Важнейший шаг для исправления ошибки 409 Conflict:
+    print("Очистка старых соединений...")
+    bot.remove_webhook()
+    time.sleep(1) 
+    
+    print("✅ Бот запущен!")
+    # Используем infinity_polling для автоматического перезапуска при сбоях сети
+    bot.infinity_polling(timeout=20, long_polling_timeout=5)
 
 if __name__ == '__main__':
-    # Запускаем веб-сервер в отдельном потоке
-    # 👇 Дописываем сюда daemon=True
-    t = Thread(target=run_web_server, daemon=True) 
-    t.start()
+    # 1. Запускаем Flask в фоновом потоке
+    server_thread = Thread(target=run_web_server, daemon=True)
+    server_thread.start()
     
-    # Запускаем бота в основном потоке
-    run_bot()
-
-
-
+    # 2. Запускаем бота в основном потоке
+    try:
+        run_bot()
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        time.sleep(5) # Пауза перед возможным рестартом контейнера
