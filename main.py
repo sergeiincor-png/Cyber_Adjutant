@@ -80,14 +80,19 @@ def run_bot():
     bot.infinity_polling(timeout=20, long_polling_timeout=5)
 
 if __name__ == '__main__':
-    # 1. Запускаем Flask в фоновом потоке
-    server_thread = Thread(target=run_web_server, daemon=True)
-    server_thread.start()
+    # 1. Сначала запускаем Flask в фоновом потоке
+    # Используем порт 5000 или 8080 (как в настройках Таймвеба)
+    port = int(os.environ.get('PORT', 8080))
+    t = Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
+    t.daemon = True
+    t.start()
     
-    # 2. Запускаем бота в основном потоке
+    # 2. Даем серверу время подняться
+    time.sleep(2)
+    
+    # 3. Запускаем бота
     try:
         run_bot()
     except Exception as e:
-        print(f"Критическая ошибка: {e}")
-        time.sleep(5) # Пауза перед возможным рестартом контейнера
+        print(f"Критический сбой бота: {e}")
 
