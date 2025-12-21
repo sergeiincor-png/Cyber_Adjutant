@@ -4,7 +4,7 @@ from flask import Flask
 from threading import Thread
 
 from google import genai
-from google.genai import types
+from google.genai.types import HttpOptions
 
 
 # --- 1) ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖКИ ЖИЗНИ (healthcheck/ping) ---
@@ -15,7 +15,6 @@ def home():
     return "Бот работает!"
 
 def run_web():
-    # Если Timeweb/балансер пингует порт — ок.
     app.run(host="0.0.0.0", port=8080)
 
 def keep_alive():
@@ -32,30 +31,32 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
 
 
 # --- 3) GEMINI (НОВЫЙ SDK) ---
-# КРИТИЧНО: фикс 404 “not found for API version v1beta”
-# Принудительно используем стабильный API v1.
+# КРИТИЧНО: по умолчанию SDK использует v1beta. Нам нужен стабильный v1. :contentReference[oaicite:2]{index=2}
 client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(api_version="v1")
+    http_options=HttpOptions(api_version="v1")
 )
 
 def pick_model_name() -> str:
     """
-    Выбираем первую доступную модель, которая поддерживает generateContent.
-    Это надежнее, чем угадывать имя модели.
+    Берём из ListModels первую модель, которая поддерживает generateContent.
+    Это самый надёжный способ, потому что доступность моделей зависит от ключа/региона/версии API. :contentReference[oaicite:3]{index=3}
     """
-    last = None
-    try:
-        for m in client.models.list():
-            actions = getattr(m, "supported_actions", None) or getattr(m, "supportedActions", []) or []
-            if "generateContent" in actions:
-                # SDK часто возвращает 'models/....' — убираем префикс
-                return (m.name or "").replace("models/", "")
-        last = "Список моделей получен, но ни одна не поддерживает generateContent."
-    except Exception as e:
-        last = f"{type(e).__name__}: {e}"
+    available = []
+    for m in client.models.list():
+        name = (m.name or "")
+        actions = getattr(m, "supported_actions", None) or getattr(m, "supportedActions", []) or []
+        if "generateContent" in actions:
+            clean = name.replace("models/", "")
+            available.append(clean)
 
-    raise RuntimeError(f"Не нашёл ни одной модели с generateContent для этого ключа. Детали: {last}")
+    print("✅ Models with generateContent:", available)
+
+    if not available:
+        raise RuntimeError("Не нашёл ни одной модели с generateContent для этого ключа (через API v1).")
+
+    # обычно первая — самая универсальная/доступная
+    return available[0]
 
 MODEL_NAME = pick_model_name()
 print("✅ Using model:", MODEL_NAME)
@@ -64,7 +65,6 @@ print("✅ Using model:", MODEL_NAME)
 # --- 4) TELEGRAM ---
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
 
-# История диалогов (храним последние N сообщений на пользователя)
 user_history = {}
 HISTORY_LIMIT = 12  # 6 реплик пользователя + 6 ответов бота
 
@@ -90,13 +90,11 @@ def gemini_answer(user_id: int, user_text: str) -> str:
     if not text:
         raise RuntimeError("Gemini вернул пустой ответ.")
 
-    # сохраняем историю
     new_history = history + [
         {"role": "user", "parts": [{"text": user_text}]},
         {"role": "model", "parts": [{"text": text}]},
     ]
     user_history[user_id] = new_history[-HISTORY_LIMIT:]
-
     return text
 
 
@@ -104,6 +102,7 @@ def gemini_answer(user_id: int, user_text: str) -> str:
 def handle_message(message):
     user_id = message.chat.id
     text = (message.text or "").strip()
+
     if not text:
         bot.reply_to(message, "Пришли текстом 🙂")
         return
@@ -112,7 +111,6 @@ def handle_message(message):
         bot.send_chat_action(user_id, "typing")
         answer = gemini_answer(user_id, text)
 
-        # Telegram лимит ~4096, режем безопасно
         chunk_size = 4000
         for i in range(0, len(answer), chunk_size):
             bot.send_message(user_id, answer[i:i + chunk_size])
@@ -127,5 +125,4 @@ if __name__ == "__main__":
     keep_alive()
     print("🚀 Web healthcheck on :8080")
     print("🤖 Bot is running (polling)...")
-    # timeout/long_polling_timeout помогают избежать подвисаний
     bot.infinity_polling(timeout=20, long_polling_timeout=20)
