@@ -62,9 +62,10 @@ def handle_message(message):
         chat = user_chats[user_id]
         response = chat.send_message(message.text)
         bot.reply_to(message, response.text)
-    except Exception as e:
-        print(f"Ошибка Gemini: {e}")
-        bot.reply_to(message, "Извини, произошла ошибка при генерации ответа.")
+   except Exception as e:
+        # Бот отправит текст самой ошибки вам в чат Telegram
+        bot.reply_to(message, f"Техническая ошибка: {str(e)}")
+        print(f"Error: {e}")
 
 # --- 4. ЗАПУСК ---
 
@@ -89,3 +90,4 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Критическая ошибка: {e}")
         time.sleep(5) # Пауза перед возможным рестартом контейнера
+
