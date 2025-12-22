@@ -1,5 +1,8 @@
 import os
 import telebot
+import sys
+print("✅ BOOT: starting python app", flush=True)
+print("✅ BOOT: python =", sys.version, flush=True)
 from flask import Flask
 from threading import Thread
 
@@ -38,19 +41,22 @@ client = genai.Client(
 )
 
 def pick_model_name() -> str:
-    """
-    Берём из ListModels первую модель, которая поддерживает generateContent.
-    Это самый надёжный способ, потому что доступность моделей зависит от ключа/региона/версии API. :contentReference[oaicite:3]{index=3}
-    """
     available = []
+    all_names = []
     for m in client.models.list():
         name = (m.name or "")
+        all_names.append(name)
         actions = getattr(m, "supported_actions", None) or getattr(m, "supportedActions", []) or []
         if "generateContent" in actions:
-            clean = name.replace("models/", "")
-            available.append(clean)
+            available.append(name.replace("models/", ""))
 
-    print("✅ Models with generateContent:", available)
+    print("✅ BOOT: total models seen =", len(all_names), flush=True)
+    print("✅ BOOT: models with generateContent =", available, flush=True)
+
+    if not available:
+        raise RuntimeError("Не нашёл ни одной модели с generateContent для этого ключа (через API v1).")
+    return available[0]
+
 
     if not available:
         raise RuntimeError("Не нашёл ни одной модели с generateContent для этого ключа (через API v1).")
@@ -126,3 +132,4 @@ if __name__ == "__main__":
     print("🚀 Web healthcheck on :8080")
     print("🤖 Bot is running (polling)...")
     bot.infinity_polling(timeout=20, long_polling_timeout=20)
+
