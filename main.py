@@ -1,8 +1,12 @@
 import os
-import telebot
 import sys
+import time
+import random
+import telebot
+
 print("✅ BOOT: starting python app", flush=True)
 print("✅ BOOT: python =", sys.version, flush=True)
+
 from flask import Flask
 from threading import Thread
 
@@ -34,7 +38,7 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
 
 
 # --- 3) GEMINI (НОВЫЙ SDK) ---
-# КРИТИЧНО: по умолчанию SDK использует v1beta. Нам нужен стабильный v1. :contentReference[oaicite:2]{index=2}
+# Важно: используем стабильный v1
 client = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=HttpOptions(api_version="v1")
@@ -55,81 +59,21 @@ def pick_model_name() -> str:
 
     if not available:
         raise RuntimeError("Не нашёл ни одной модели с generateContent для этого ключа (через API v1).")
-    return available[0]
 
-
-    if not available:
-        raise RuntimeError("Не нашёл ни одной модели с generateContent для этого ключа (через API v1).")
-
-    # обычно первая — самая универсальная/доступная
+    # Берем первую доступную (обычно универсальная)
     return available[0]
 
 MODEL_NAME = pick_model_name()
-print("✅ Using model:", MODEL_NAME)
+print("✅ Using model:", MODEL_NAME, flush=True)
 
 
 # --- 4) TELEGRAM ---
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
 
 user_history = {}
-HISTORY_LIMIT = 12  # 6 реплик пользователя + 6 ответов бота
+HISTORY_LIMIT = 6  # меньше истории = меньше токенов = меньше шанс упереться в лимиты
 
-SYSTEM_PROMPT = (
-    "Ты — полезный ассистент в Telegram. Отвечай кратко и по делу. "
-    "Если вопрос непонятен — задай 1 уточняющий вопрос."
-)
-
-def gemini_answer(user_id: int, user_text: str) -> str:
-    history = user_history.get(user_id, [])
-    contents = [
-        {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
-        *history,
-        {"role": "user", "parts": [{"text": user_text}]},
-    ]
-
-    resp = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-    )
-
-    text = (resp.text or "").strip()
-    if not text:
-        raise RuntimeError("Gemini вернул пустой ответ.")
-
-    new_history = history + [
-        {"role": "user", "parts": [{"text": user_text}]},
-        {"role": "model", "parts": [{"text": text}]},
-    ]
-    user_history[user_id] = new_history[-HISTORY_LIMIT:]
-    return text
+SYSTEM_PROMPT = "Отвечай кратко и по делу. Если вопрос неясен — задай 1 уточняющий вопрос."
 
 
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    user_id = message.chat.id
-    text = (message.text or "").strip()
-
-    if not text:
-        bot.reply_to(message, "Пришли текстом 🙂")
-        return
-
-    try:
-        bot.send_chat_action(user_id, "typing")
-        answer = gemini_answer(user_id, text)
-
-        chunk_size = 4000
-        for i in range(0, len(answer), chunk_size):
-            bot.send_message(user_id, answer[i:i + chunk_size])
-
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        print("❌ Gemini error:", err)
-        bot.reply_to(message, "Gemini сейчас не отвечает. Ошибка: " + err[:350])
-
-
-if __name__ == "__main__":
-    keep_alive()
-    print("🚀 Web healthcheck on :8080")
-    print("🤖 Bot is running (polling)...")
-    bot.infinity_polling(timeout=20, long_polling_timeout=20)
-
+# --- 5) ЗАЩИТА ОТ СПАМА (чтобы один юзер не сжёг квоту) ---
