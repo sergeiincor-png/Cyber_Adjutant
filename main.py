@@ -1,103 +1,107 @@
 import os
 import time
-import telebot
-from flask import Flask
-from threading import Thread
-from openai import OpenAI
+import threading
+from collections import deque
+from typing import Optional
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from google import genai
+from google.genai import types
 
 
-# --- 1) HEALTHCHECK ---
-app = Flask(__name__)
+# ---------- Простые лимиты ----------
+class RateLimiter:
+    """
+    Ограничение по запросам: max_calls за period_seconds (скользящее окно).
+    """
+    def __init__(self, max_calls: int, period_seconds: int):
+        self.max_calls = max_calls
+        self.period = period_seconds
+        self.lock = threading.Lock()
+        self.calls = deque()
 
-@app.route("/")
-def home():
-    return "Бот работает!"
+    def acquire(self):
+        with self.lock:
+            now = time.time()
+            # выкидываем старые
+            while self.calls and self.calls[0] <= now - self.period:
+                self.calls.popleft()
 
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
+            if len(self.calls) >= self.max_calls:
+                sleep_for = (self.calls[0] + self.period) - now
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                # после сна чистим ещё раз
+                now = time.time()
+                while self.calls and self.calls[0] <= now - self.period:
+                    self.calls.popleft()
 
-def keep_alive():
-    Thread(target=run_web, daemon=True).start()
+            self.calls.append(time.time())
 
 
-# --- 2) КЛЮЧИ ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# ---------- Настройки лимитов ----------
+# Пример: 60 запросов в минуту, не больше 2 одновременных запросов
+RPM = int(os.getenv("GEMINI_RPM", "60"))
+CONCURRENCY = int(os.getenv("GEMINI_CONCURRENCY", "2"))
+MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
-    raise RuntimeError("Проверь TELEGRAM_TOKEN и OPENAI_API_KEY")
+rate_limiter = RateLimiter(max_calls=RPM, period_seconds=60)
+semaphore = threading.Semaphore(CONCURRENCY)
 
-# --- 3) OPENAI ---
-client = OpenAI(api_key=OPENAI_API_KEY)
 
-MODEL_NAME = "gpt-4o-mini"  # быстрый и дешёвый
+class GeminiError(Exception):
+    pass
 
-# --- 4) TELEGRAM ---
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-user_history = {}
-HISTORY_LIMIT = 10
-last_request_at = {}
-USER_COOLDOWN_SEC = 2
+def _is_retryable_exc(exc: Exception) -> bool:
+    # Можно расширить: таймауты, 429, 5xx, сетевые ошибки и т.п.
+    msg = str(exc).lower()
+    return any(k in msg for k in ["429", "rate", "quota", "timeout", "temporarily", "unavailable", "500", "503"])
 
-SYSTEM_PROMPT = (
-    "Ты — полезный ассистент в Telegram. Отвечай кратко и по делу. "
-    "Если вопрос непонятен — задай 1 уточняющий вопрос."
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=20),
+    retry=retry_if_exception_type(GeminiError),
 )
+def gemini_generate_text(prompt: str, system: Optional[str] = None) -> str:
+    """
+    Генерация текста Gemini с лимитами: RPM + concurrency + ретраи.
+    """
+    # лимиты
+    rate_limiter.acquire()
+    with semaphore:
+        try:
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                raise GeminiError("GEMINI_API_KEY is not set")
 
-def chatgpt_answer(user_id: int, user_text: str) -> str:
-    history = user_history.get(user_id, [])
+            client = genai.Client(api_key=api_key)
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += history
-    messages.append({"role": "user", "content": user_text})
+            contents = []
+            if system:
+                # system можно зашить в инструкции или в отдельный content
+                contents.append(types.Content(role="user", parts=[types.Part(text=f"System: {system}")]))
+            contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
 
-    resp = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        temperature=0.7,
-    )
+            resp = client.models.generate_content(
+                model=MODEL,
+                contents=contents,
+                # Можно добавить safety/settings/temperature
+                config=types.GenerateContentConfig(
+                    temperature=0.4,
+                    max_output_tokens=800,
+                ),
+            )
 
-    text = resp.choices[0].message.content.strip()
+            text = getattr(resp, "text", None)
+            if not text:
+                raise GeminiError(f"Empty response: {resp}")
+            return text
 
-    new_history = history + [
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": text},
-    ]
-    user_history[user_id] = new_history[-HISTORY_LIMIT:]
-
-    return text
-
-
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    user_id = message.chat.id
-    text = (message.text or "").strip()
-
-    if not text:
-        bot.reply_to(message, "Напиши текст 🙂")
-        return
-
-    now = time.time()
-    if now - last_request_at.get(user_id, 0) < USER_COOLDOWN_SEC:
-        bot.reply_to(message, "Подожди пару секунд 🙂")
-        return
-    last_request_at[user_id] = now
-
-    try:
-        bot.send_chat_action(user_id, "typing")
-        answer = chatgpt_answer(user_id, text)
-
-        for i in range(0, len(answer), 4000):
-            bot.send_message(user_id, answer[i:i+4000])
-
-    except Exception as e:
-        err = str(e)
-        print("❌ OpenAI error:", err)
-        bot.reply_to(message, "Ошибка ИИ. Попробуй позже.")
-
-
-if __name__ == "__main__":
-    keep_alive()
-    print("🤖 Bot with ChatGPT is running...")
-    bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            # решаем — ретраим или нет
+            if _is_retryable_exc(e):
+                raise GeminiError(str(e))
+            raise
