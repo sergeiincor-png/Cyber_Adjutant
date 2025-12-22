@@ -1,129 +1,90 @@
 import os
 import sys
-import time
-import random
 import telebot
 from flask import Flask
 from threading import Thread
-
 from openai import OpenAI
-from openai import RateLimitError, APIError, APITimeoutError
 
+# =========================
+# BOOT LOG
+# =========================
 print("✅ BOOT: starting python app", flush=True)
 print("✅ BOOT: python =", sys.version, flush=True)
 
-# --- 1) ВЕБ-СЕРВЕР ДЛЯ HEALTHCHECK ---
+# =========================
+# ENV
+# =========================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+
+if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
+    raise RuntimeError(
+        "❌ Проверь переменные окружения TELEGRAM_TOKEN и OPENROUTER_API_KEY"
+    )
+
+# =========================
+# FLASK (healthcheck)
+# =========================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Бот работает!"
 
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
+def run_flask():
+    app.run(host="0.0.0.0", port=8080, debug=False)
 
-def keep_alive():
-    t = Thread(target=run_web, daemon=True)
-    t.start()
-
-# --- 2) ENV / КЛЮЧИ ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-
-# Ключ OpenRouter
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-
-# Модель по умолчанию (можно поменять в переменной окружения MODEL)
-# Примеры:
-#   "openai/gpt-4o-mini"
-#   "anthropic/claude-3.5-sonnet"
-#   "google/gemini-2.0-flash"
-MODEL = os.environ.get("MODEL", "openai/gpt-4o-mini")
-
-# Для статистики/правильной идентификации на OpenRouter
-SITE_URL = os.environ.get("SITE_URL", "https://example.com")
-APP_NAME = os.environ.get("APP_NAME", "TimewebTelegramBot")
-
-if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
-    raise RuntimeError("Проверь переменные окружения TELEGRAM_TOKEN и OPENROUTER_API_KEY")
-
-# --- 3) OpenRouter client (OpenAI-compatible) ---
+# =========================
+# OPENROUTER CLIENT
+# =========================
 client = OpenAI(
     api_key=OPENROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
+    base_url="https://openrouter.ai/api/v1"
 )
 
-# Важно: OpenRouter просит эти заголовки (не обязательно, но желательно)
-DEFAULT_HEADERS = {
-    "HTTP-Referer": SITE_URL,
-    "X-Title": APP_NAME,
-}
+MODEL_NAME = "openai/gpt-4o-mini"  # дешёвый и стабильный
 
-# --- 4) TELEGRAM ---
+# =========================
+# TELEGRAM
+# =========================
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
 
 user_history = {}
-HISTORY_LIMIT = 12  # 6 реплик пользователя + 6 ответов ассистента
+HISTORY_LIMIT = 12
 
 SYSTEM_PROMPT = (
-    "Ты — полезный ассистент в Telegram. Отвечай кратко и по делу. "
-    "Если вопрос непонятен — задай 1 уточняющий вопрос."
+    "Ты — полезный ассистент в Telegram. "
+    "Отвечай кратко и по делу. "
+    "Если вопрос непонятен — задай один уточняющий вопрос."
 )
 
-def _truncate_history(history, limit):
-    return history[-limit:] if len(history) > limit else history
-
-def openrouter_answer(user_id: int, user_text: str) -> str:
+def ai_answer(user_id: int, user_text: str) -> str:
     history = user_history.get(user_id, [])
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_text})
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *history,
+        {"role": "user", "content": user_text},
+    ]
 
-    # ретраи на 429/временные ошибки
-    max_retries = 5
-    base_sleep = 1.0
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.7,
+    )
 
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                temperature=0.7,
-                extra_headers=DEFAULT_HEADERS,
-            )
+    text = response.choices[0].message.content.strip()
 
-            text = (resp.choices[0].message.content or "").strip()
-            if not text:
-                raise RuntimeError("Провайдер вернул пустой ответ.")
+    if not text:
+        raise RuntimeError("AI вернул пустой ответ")
 
-            # сохраняем историю
-            new_history = history + [
-                {"role": "user", "content": user_text},
-                {"role": "assistant", "content": text},
-            ]
-            user_history[user_id] = _truncate_history(new_history, HISTORY_LIMIT)
-            return text
+    new_history = history + [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": text},
+    ]
 
-        except RateLimitError as e:
-            # 429 — подождать и повторить
-            last_err = e
-            sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-            print(f"⚠️ Rate limit (attempt {attempt}/{max_retries}), sleeping {sleep_s:.2f}s", flush=True)
-            time.sleep(sleep_s)
-
-        except (APITimeoutError, APIError) as e:
-            # временные/сетевые ошибки
-            last_err = e
-            sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-            print(f"⚠️ API error (attempt {attempt}/{max_retries}), sleeping {sleep_s:.2f}s: {e}", flush=True)
-            time.sleep(sleep_s)
-
-        except Exception as e:
-            # прочие ошибки — без агрессивных ретраев
-            raise
-
-    raise RuntimeError(f"OpenRouter сейчас не отвечает (после ретраев). Последняя ошибка: {type(last_err).__name__}: {last_err}")
+    user_history[user_id] = new_history[-HISTORY_LIMIT:]
+    return text
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
@@ -131,4 +92,29 @@ def handle_message(message):
     text = (message.text or "").strip()
 
     if not text:
-        bot.reply_to(messag_
+        bot.reply_to(message, "Пришли текстом 🙂")
+        return
+
+    try:
+        bot.send_chat_action(user_id, "typing")
+        answer = ai_answer(user_id, text)
+
+        for i in range(0, len(answer), 4000):
+            bot.send_message(user_id, answer[i:i + 4000])
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print("❌ AI error:", err, flush=True)
+        bot.reply_to(message, "Ошибка ИИ. Попробуй позже.")
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+    # Flask в отдельном потоке
+    Thread(target=run_flask, daemon=True).start()
+
+    print("🤖 Telegram bot polling started", flush=True)
+
+    # Telegram polling в основном потоке
+    bot.infinity_polling(timeout=20, long_polling_timeout=20)
